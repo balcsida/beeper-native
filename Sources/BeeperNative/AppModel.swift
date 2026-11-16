@@ -25,11 +25,32 @@ final class AppModel {
     var hitChats: [String: Chat] = [:]
     var hitsCursor: String?
     private var query = ""
+    /// Whether the user loaded search pages past the first, which a live refresh must then keep.
+    private var searchPaged = false
+    /// The search hit to reveal once its chat has opened.
+    private var pendingHit: Message?
+    /// The message the chat view should scroll to and highlight.
+    var scrollTarget: Message.ID?
+    /// Bumped per jump, so jumping to the same message twice still scrolls.
+    var scrollRequests = 0
+    /// Identifies the newest jump, so an older one still paging gives way to it.
+    private var revealGeneration = 0
+    private var isLoadingOlder = false
     /// The selected chat as it was when opened, for chats outside the loaded list.
     private var openedChat: Chat?
     var replyingTo: Message?
     var editing: Message?
-    var pendingFile: URL?
+    var pendingFile: URL? {
+        didSet {
+            // pasted images are our own temp files: drop them once sent, replaced or removed
+            if let oldValue, oldValue != pendingFile, oldValue.lastPathComponent.hasPrefix(Self.pastedPrefix),
+                oldValue.deletingLastPathComponent().standardizedFileURL == FileManager.default.temporaryDirectory.standardizedFileURL
+            {
+                try? FileManager.default.removeItem(at: oldValue)
+            }
+        }
+    }
+    private static let pastedPrefix = "Pasted Image "
     var isSending = false
     private var notifier: Notifier?
     private var notified: Set<Message.ID> = []
@@ -75,7 +96,7 @@ final class AppModel {
             let tiff = image.tiffRepresentation,
             let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:])
         else { return false }
-        let file = FileManager.default.temporaryDirectory.appending(path: "Pasted Image \(UUID().uuidString.prefix(8)).png")
+        let file = FileManager.default.temporaryDirectory.appending(path: "\(Self.pastedPrefix)\(UUID().uuidString.prefix(8)).png")
         guard (try? png.write(to: file)) != nil else { return false }
         pendingFile = file
         return true
@@ -89,6 +110,7 @@ final class AppModel {
     func signIn(token: String) {
         Keychain.token = token
         connect(token: token)
+        if Keychain.token != token { error = "Couldn't save the token to the Keychain. You'll have to enter it again next time." }
     }
 
     func signOut() {
@@ -109,12 +131,14 @@ final class AppModel {
         liveTask?.cancel()
         liveTask = Task {
             while !Task.isCancelled {
-                await refreshChats()
-                await refreshMessages()  // catch up on what arrived while disconnected
+                // background: a success here must not wipe an error the user has yet to read
+                await refreshChats(background: true)
+                await refreshMessages(background: true)  // catch up on what arrived while disconnected
                 do {
                     // shortcut: refetches on every event instead of merging it, upgrade if bursts feel slow
                     for try await event in client.events() where event.chatID != nil {
                         await refreshChats(background: true)
+                        await refreshSearch()
                         notify(event)
                         guard event.chatID == selection else { continue }
                         if event.type == "message.deleted" { messages.removeAll { event.ids?.contains($0.id) == true } }
@@ -196,12 +220,31 @@ final class AppModel {
             guard !Task.isCancelled else { return }
             searchResults = page.items
             searchCursor = page.hasMore ? page.oldestCursor : nil
+            searchPaged = false
             guard !query.isEmpty else { return }
             let hits = try await client.searchMessages(query)
             guard !Task.isCancelled else { return }
             messageHits = hits.items
             hitChats = hits.chats
             hitsCursor = hits.hasMore ? hits.oldestCursor : nil
+        }
+    }
+
+    /// Re-reads the first page of the shown search or inbox after a live event.
+    private func refreshSearch() async {
+        guard let client, searchResults != nil else { return }
+        let (query, inbox) = (query, inbox)
+        await attempt(background: true) {
+            let page = try await client.searchChats(query, inbox: inbox)
+            guard query == self.query, inbox == self.inbox, let shown = searchResults else { return }
+            if searchPaged {
+                // shortcut: rows on later pages keep their old state, refetch every loaded page if that shows
+                let fresh = Set(page.items.map(\.id))
+                searchResults = page.items + shown.filter { !fresh.contains($0.id) }
+            } else {
+                searchResults = page.items
+                searchCursor = page.hasMore ? page.oldestCursor : nil
+            }
         }
     }
 
@@ -215,6 +258,7 @@ final class AppModel {
             let known = Set(shown.map(\.id))
             searchResults = shown + page.items.filter { !known.contains($0.id) }
             searchCursor = page.hasMore ? page.oldestCursor : nil
+            searchPaged = true
         }
         if !ok, query == self.query, inbox == self.inbox { searchCursor = cursor }
     }
@@ -286,6 +330,9 @@ final class AppModel {
         editing = nil
         pendingFile = nil
         openedChat = nil
+        scrollTarget = nil
+        let hit = pendingHit
+        pendingHit = nil
         guard let chatID = selection else { return }
         openedChat = chats.first { $0.id == chatID } ?? searchResults?.first { $0.id == chatID } ?? hitChats[chatID]
         Task {
@@ -293,6 +340,46 @@ final class AppModel {
             if openedChat == nil, let client, let chat = try? await client.chat(chatID), selection == chatID { openedChat = chat }
             await refreshMessages()
             await markSelectedRead()
+            if let hit, hit.chatID == chatID { await reveal(hit) }
+        }
+    }
+
+    /// Opens the chat of a search hit and scrolls to the message.
+    func open(hit: Message) {
+        if selection == hit.chatID {
+            Task { await reveal(hit) }
+        } else {
+            pendingHit = hit
+            selection = hit.chatID
+        }
+    }
+
+    private func reveal(_ hit: Message) async {
+        revealGeneration += 1
+        let generation = revealGeneration
+        var current: Bool { generation == revealGeneration && selection == hit.chatID }
+        if messages.isEmpty { await refreshMessages() }
+        // The API only pages backwards from the newest message, so walk back until the hit is loaded.
+        // shortcut: gives up after 100 pages (about 2000 messages), load a window around the hit if that is too short
+        var pages = 0
+        while current, !messages.contains(where: { $0.id == hit.id }), pages < 100,
+            (messages.first?.timestamp ?? .distantFuture) > hit.timestamp
+        {
+            if isLoadingOlder {  // someone else's page is in flight, and the cursor is nil until it lands
+                try? await Task.sleep(for: .milliseconds(50))
+                continue
+            }
+            guard let before = messagesCursor else { break }
+            await loadOlderMessages()
+            pages += 1
+            if messagesCursor == before { break }  // the page failed; its error is already in the banner
+        }
+        guard current else { return }
+        if messages.contains(where: { $0.id == hit.id }) {
+            scrollTarget = hit.id
+            scrollRequests += 1
+        } else if error == nil {
+            error = "That message is too far back in the chat to jump to."
         }
     }
 
@@ -310,6 +397,8 @@ final class AppModel {
     func loadOlderMessages() async {
         guard let client, let chatID = selection, let cursor = messagesCursor else { return }
         messagesCursor = nil
+        isLoadingOlder = true
+        defer { isLoadingOlder = false }
         let ok = await attempt {
             let page = try await client.messages(chatID: chatID, before: cursor)
             guard selection == chatID else { return }

@@ -83,7 +83,7 @@ struct MainView: View {
                     Section("Messages") {
                         ForEach(model.messageHits) { hit in
                             // a button, not a tag: several hits share one chat ID and would all highlight
-                            Button { model.selection = hit.chatID } label: {
+                            Button { model.open(hit: hit) } label: {
                                 MessageHitRow(hit: hit, chat: model.hitChats[hit.chatID])
                                     .frame(maxWidth: .infinity, alignment: .leading)
                                     .contentShape(.rect)
@@ -204,23 +204,30 @@ struct ChatView: View {
     @FocusState private var composerFocused: Bool
 
     var body: some View {
-        ScrollView {
-            LazyVStack(spacing: 6) {
-                if model.messagesCursor != nil {
-                    Button("Load Earlier Messages") { Task { await model.loadOlderMessages() } }
-                        .buttonStyle(.link)
+        ScrollViewReader { scroller in
+            ScrollView {
+                LazyVStack(spacing: 2) {
+                    if model.messagesCursor != nil {
+                        Button("Load Earlier Messages") { Task { await model.loadOlderMessages() } }
+                            .buttonStyle(.link)
+                    }
+                    ForEach(model.messages) { message in
+                        MessageRow(
+                            message: message, showSender: chat.type == "group",
+                            quoted: message.linkedMessageID.flatMap { id in model.messages.first { $0.id == id } }
+                        )
+                        .contextMenu { menu(for: message) }
+                        .padding(.horizontal, 4).padding(.vertical, 2)
+                        .background(message.id == model.scrollTarget ? Color.yellow.opacity(0.25) : .clear, in: .rect(cornerRadius: 8))
+                    }
                 }
-                ForEach(model.messages) { message in
-                    MessageRow(
-                        message: message, showSender: chat.type == "group",
-                        quoted: message.linkedMessageID.flatMap { id in model.messages.first { $0.id == id } }
-                    )
-                    .contextMenu { menu(for: message) }
-                }
+                .padding()
             }
-            .padding()
+            .defaultScrollAnchor(.bottom)
+            .onChange(of: model.scrollRequests) {
+                if let target = model.scrollTarget { withAnimation { scroller.scrollTo(target, anchor: .center) } }
+            }
         }
-        .defaultScrollAnchor(.bottom)
         .safeAreaInset(edge: .bottom, spacing: 0) { composer }
         .navigationTitle(chat.title)
         .navigationSubtitle(chat.network)
