@@ -1,6 +1,16 @@
 # Beeper Native
 
-A native macOS client (SwiftUI) for Beeper. It talks to the local [Beeper Desktop API](https://developers.beeper.com/desktop-api), so Beeper Desktop has to be running in the background.
+An unofficial native macOS client (SwiftUI) for Beeper. It talks to the local [Beeper Desktop API](https://developers.beeper.com/desktop-api), so Beeper Desktop has to be running in the background.
+
+This project is not affiliated with or endorsed by Beeper or Automattic. "Beeper" is their trademark and is used here only to say what the app connects to.
+
+It is an early version that I use myself. Beeper recommends the Desktop API for personal use only, so please keep it that way.
+
+## Requirements
+
+- macOS 14 or later
+- Xcode 16 or later (Swift 6)
+- Beeper Desktop with the Desktop API enabled
 
 ## Setup
 
@@ -17,3 +27,7 @@ A native macOS client (SwiftUI) for Beeper. It talks to the local [Beeper Deskto
 ## Tests
 
 `swift test` runs the offline tests. With `BEEPER_TOKEN` set it also reads from the running Beeper. `BEEPER_SELF_TEST=1` on top of that sends, edits and deletes test messages in your "Note to self" chat.
+
+## License
+
+[MIT](LICENSE)
